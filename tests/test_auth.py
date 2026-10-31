@@ -11,6 +11,110 @@ import credential_tool
 from credential_crypto import CredentialError, decrypt_credentials_token, encrypt_credentials_token
 
 class AutomaticLoginTests(unittest.TestCase):
+    def setUp(self):
+        with app._swarm_cache_lock:
+            app._swarm_cache.clear()
+
+    def test_magnet_metadata_supports_hex_and_base32_hashes(self):
+        raw_hash = bytes(range(20))
+        base32_hash = app.base64.b32encode(raw_hash).decode("ascii")
+        for token in (raw_hash.hex(), base32_hash.lower()):
+            info_hash, trackers = app.magnet_metadata(
+                "magnet:?xt=urn:btih:"
+                + token
+                + "&tr=udp%3A%2F%2Ftracker.example%3A80%2Fannounce"
+                + "&tr=https%3A%2F%2Ftracker.example%2Fannounce"
+            )
+            self.assertEqual(info_hash, raw_hash)
+            self.assertEqual(len(trackers), 2)
+
+    def test_http_tracker_scrape_decodes_counts(self):
+        info_hash = bytes(range(20))
+        payload = (
+            b"d5:filesd20:" + info_hash
+            + b"d8:completei7e10:incompletei2eeee"
+        )
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _limit):
+                return payload
+
+        with patch.object(app.urllib.request, "urlopen", return_value=FakeResponse()) as open_url:
+            result = app.http_tracker_scrape(
+                "https://tracker.example/announce?passkey=test",
+                [info_hash],
+            )
+
+        self.assertEqual(result[info_hash], (7, 2))
+        request_url = open_url.call_args.args[0].full_url
+        self.assertIn("/scrape?passkey=test&info_hash=", request_url)
+
+    def test_udp_tracker_scrape_decodes_counts(self):
+        info_hash = bytes(range(20))
+        fake_socket = MagicMock()
+        fake_socket.recvfrom.side_effect = [
+            (app.struct.pack("!iiq", 0, 101, 999), ("tracker.example", 80)),
+            (app.struct.pack("!iiiii", 2, 202, 11, 30, 4), ("tracker.example", 80)),
+        ]
+        with (
+            patch.object(app.socket, "getaddrinfo", return_value=[
+                (app.socket.AF_INET, app.socket.SOCK_DGRAM, 17, "", ("127.0.0.1", 80))
+            ]),
+            patch.object(app.socket, "socket", return_value=fake_socket),
+            patch.object(app.secrets, "randbelow", side_effect=[101, 202]),
+        ):
+            result = app.udp_tracker_scrape(
+                "udp://tracker.example:80/announce",
+                [info_hash],
+            )
+
+        self.assertEqual(result[info_hash], (11, 4))
+        self.assertEqual(fake_socket.sendto.call_count, 2)
+
+    def test_swarm_aggregation_uses_highest_tracker_report_not_sum(self):
+        info_hash = bytes(range(20))
+        link = (
+            f"magnet:?xt=urn:btih:{info_hash.hex()}"
+            "&tr=https%3A%2F%2Fone.example%2Fannounce"
+            "&tr=udp%3A%2F%2Ftwo.example%3A80%2Fannounce"
+        )
+        releases = [{"link": link}]
+
+        def fake_scrape(tracker, _hashes):
+            return {info_hash: (8, 3)} if "one.example" in tracker else {info_hash: (12, 5)}
+
+        with (
+            patch.object(app, "tracker_scrape", side_effect=fake_scrape),
+            patch.object(app, "TRACKER_SCRAPE_WORKERS", 2),
+        ):
+            known = app.enrich_swarm_counts(releases)
+
+        self.assertEqual(known, 1)
+        self.assertEqual(releases[0]["seeders"], 12)
+        self.assertEqual(releases[0]["peers"], 17)
+        self.assertTrue(releases[0]["swarm_known"])
+
+    def test_rss_uses_measured_swarm_counts(self):
+        release = {
+            "title": "Measured release",
+            "link": "magnet:?xt=urn:btih:abc",
+            "details": "https://www.mini4k.com/torrents/1",
+            "size": 123,
+            "date": app.datetime.now(app.timezone.utc),
+            "category": 2045,
+            "seeders": 9,
+            "peers": 13,
+        }
+        xml = app.rss_xml([release])
+        self.assertIn('name="seeders" value="9"', xml)
+        self.assertIn('name="peers" value="13"', xml)
+
     def test_torznab_feed_keeps_valid_magnet_link(self):
         release = {
             "title": "Ice Age 2002 2160p",

@@ -1,11 +1,17 @@
+import base64
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
+import socket
+import struct
+import time
 import urllib.parse
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -55,9 +61,26 @@ DEFAULT_USER_AGENT = (
 )
 MAX_WORKS = max(1, min(int(os.getenv("MAX_WORKS", "4")), 10))
 MAX_RESULTS = max(1, min(int(os.getenv("MAX_RESULTS", "100")), 200))
+TRACKER_SCRAPE_ENABLED = os.getenv("TRACKER_SCRAPE_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+TRACKER_SCRAPE_TIMEOUT = max(
+    1.0, min(float(os.getenv("TRACKER_SCRAPE_TIMEOUT", "3")), 30.0)
+)
+TRACKER_SCRAPE_CACHE_MINUTES = max(
+    1, min(int(os.getenv("TRACKER_SCRAPE_CACHE_MINUTES", "30")), 1440)
+)
+TRACKER_SCRAPE_MAX_RESULTS = max(
+    1, min(int(os.getenv("TRACKER_SCRAPE_MAX_RESULTS", "50")), 200)
+)
+TRACKER_SCRAPE_WORKERS = max(
+    1, min(int(os.getenv("TRACKER_SCRAPE_WORKERS", "12")), 32)
+)
 TEST_QUERY_MOVIE = os.getenv("TEST_QUERY_MOVIE", os.getenv("TEST_QUERY", "沙丘")).strip() or "沙丘"
 TEST_QUERY_TV = os.getenv("TEST_QUERY_TV", "怪奇物语").strip() or "怪奇物语"
 _browser_lock = Lock()
+_swarm_cache_lock = Lock()
+_swarm_cache = {}
 
 
 def xml_escape(value):
@@ -356,6 +379,264 @@ def parse_size(value):
     return int(amount * (1024 ** powers[match.group(2).upper()]))
 
 
+def magnet_metadata(link):
+    """Return the binary BTIH and advertised tracker URLs from a magnet."""
+    if not str(link or "").lower().startswith("magnet:?"):
+        return None, []
+    values = urllib.parse.parse_qs(
+        urllib.parse.urlsplit(link).query,
+        keep_blank_values=False,
+    )
+    info_hash = None
+    for exact_topic in values.get("xt", []):
+        match = re.fullmatch(r"(?i)urn:btih:([a-z2-7]{32}|[0-9a-f]{40})", exact_topic)
+        if not match:
+            continue
+        token = match.group(1)
+        try:
+            info_hash = (
+                bytes.fromhex(token)
+                if len(token) == 40
+                else base64.b32decode(token.upper(), casefold=True)
+            )
+        except (ValueError, TypeError):
+            continue
+        if len(info_hash) == 20:
+            break
+        info_hash = None
+    trackers = []
+    seen = set()
+    for tracker in values.get("tr", []):
+        tracker = tracker.strip()
+        parsed = urllib.parse.urlsplit(tracker)
+        if (
+            tracker
+            and parsed.scheme.lower() in {"http", "https", "udp"}
+            and parsed.hostname
+            and tracker not in seen
+        ):
+            trackers.append(tracker)
+            seen.add(tracker)
+    return info_hash, trackers
+
+
+def bdecode(data):
+    """Decode the bounded bencoded response returned by an HTTP tracker."""
+    if not isinstance(data, bytes) or len(data) > 2 * 1024 * 1024:
+        raise ValueError("Invalid bencoded tracker response")
+
+    def decode_at(position, depth=0):
+        if depth > 32 or position >= len(data):
+            raise ValueError("Invalid bencoded tracker response")
+        marker = data[position:position + 1]
+        if marker == b"i":
+            end = data.find(b"e", position + 1)
+            if end < 0:
+                raise ValueError("Invalid bencoded integer")
+            return int(data[position + 1:end]), end + 1
+        if marker == b"l":
+            result = []
+            position += 1
+            while position < len(data) and data[position:position + 1] != b"e":
+                value, position = decode_at(position, depth + 1)
+                result.append(value)
+            if position >= len(data):
+                raise ValueError("Invalid bencoded list")
+            return result, position + 1
+        if marker == b"d":
+            result = {}
+            position += 1
+            while position < len(data) and data[position:position + 1] != b"e":
+                key, position = decode_at(position, depth + 1)
+                if not isinstance(key, bytes):
+                    raise ValueError("Invalid bencoded dictionary key")
+                value, position = decode_at(position, depth + 1)
+                result[key] = value
+            if position >= len(data):
+                raise ValueError("Invalid bencoded dictionary")
+            return result, position + 1
+        colon = data.find(b":", position, min(len(data), position + 24))
+        if colon < 0:
+            raise ValueError("Invalid bencoded byte string")
+        length = int(data[position:colon])
+        start = colon + 1
+        end = start + length
+        if length < 0 or end > len(data):
+            raise ValueError("Invalid bencoded byte string length")
+        return data[start:end], end
+
+    decoded, end = decode_at(0)
+    if end != len(data):
+        raise ValueError("Trailing data in bencoded tracker response")
+    return decoded
+
+
+def http_scrape_url(tracker):
+    parsed = urllib.parse.urlsplit(tracker)
+    path = re.sub(r"(?i)announce(?=[^/]*$)", "scrape", parsed.path, count=1)
+    if path == parsed.path:
+        return None
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+
+
+def http_tracker_scrape(tracker, info_hashes):
+    scrape_url = http_scrape_url(tracker)
+    if not scrape_url:
+        return {}
+    separator = "&" if urllib.parse.urlsplit(scrape_url).query else "?"
+    hash_query = "&".join(
+        f"info_hash={urllib.parse.quote_from_bytes(info_hash)}"
+        for info_hash in info_hashes
+    )
+    request_url = f"{scrape_url}{separator}{hash_query}"
+    req = urllib.request.Request(
+        request_url,
+        headers={"User-Agent": "Mini4K-Torznab/1.0", "Accept": "*/*"},
+    )
+    with urllib.request.urlopen(req, timeout=TRACKER_SCRAPE_TIMEOUT) as response:
+        payload = response.read(2 * 1024 * 1024 + 1)
+    decoded = bdecode(payload)
+    files = decoded.get(b"files", {}) if isinstance(decoded, dict) else {}
+    results = {}
+    for info_hash in info_hashes:
+        stats = files.get(info_hash)
+        if not isinstance(stats, dict):
+            continue
+        seeders = max(0, int(stats.get(b"complete", 0) or 0))
+        leechers = max(0, int(stats.get(b"incomplete", 0) or 0))
+        results[info_hash] = (seeders, leechers)
+    return results
+
+
+def udp_tracker_scrape(tracker, info_hashes):
+    parsed = urllib.parse.urlsplit(tracker)
+    if not parsed.hostname or not parsed.port:
+        return {}
+    addresses = socket.getaddrinfo(
+        parsed.hostname,
+        parsed.port,
+        type=socket.SOCK_DGRAM,
+    )
+    last_error = None
+    for family, socket_type, protocol, _, address in addresses:
+        sock = socket.socket(family, socket_type, protocol)
+        sock.settimeout(TRACKER_SCRAPE_TIMEOUT)
+        try:
+            transaction = secrets.randbelow(0x7FFFFFFF)
+            sock.sendto(struct.pack("!qii", 0x41727101980, 0, transaction), address)
+            response, _ = sock.recvfrom(2048)
+            if len(response) < 16:
+                raise RuntimeError("Short UDP tracker connect response")
+            action, returned_transaction, connection_id = struct.unpack("!iiq", response[:16])
+            if action != 0 or returned_transaction != transaction:
+                raise RuntimeError("Invalid UDP tracker connect response")
+
+            transaction = secrets.randbelow(0x7FFFFFFF)
+            request_data = struct.pack("!qii", connection_id, 2, transaction) + b"".join(info_hashes)
+            sock.sendto(request_data, address)
+            response, _ = sock.recvfrom(max(2048, 8 + 12 * len(info_hashes)))
+            if len(response) < 8:
+                raise RuntimeError("Short UDP tracker scrape response")
+            action, returned_transaction = struct.unpack("!ii", response[:8])
+            if action != 2 or returned_transaction != transaction:
+                raise RuntimeError("Invalid UDP tracker scrape response")
+            body = response[8:]
+            if len(body) < 12 * len(info_hashes):
+                raise RuntimeError("Incomplete UDP tracker scrape response")
+            results = {}
+            for index, info_hash in enumerate(info_hashes):
+                seeders, _, leechers = struct.unpack(
+                    "!iii", body[index * 12:(index + 1) * 12]
+                )
+                results[info_hash] = (max(0, seeders), max(0, leechers))
+            return results
+        except (OSError, RuntimeError) as exc:
+            last_error = exc
+        finally:
+            sock.close()
+    if last_error:
+        raise last_error
+    return {}
+
+
+def tracker_scrape(tracker, info_hashes):
+    scheme = urllib.parse.urlsplit(tracker).scheme.lower()
+    if scheme in {"http", "https"}:
+        return http_tracker_scrape(tracker, info_hashes)
+    if scheme == "udp":
+        return udp_tracker_scrape(tracker, info_hashes)
+    return {}
+
+
+def enrich_swarm_counts(releases):
+    """Populate real tracker-observed swarm counts for magnet releases."""
+    now = time.monotonic()
+    hash_items = {}
+    hash_trackers = {}
+    for item in releases[:TRACKER_SCRAPE_MAX_RESULTS]:
+        item["seeders"] = 0
+        item["peers"] = 0
+        item["swarm_known"] = False
+        info_hash, trackers = magnet_metadata(item.get("link"))
+        if not info_hash:
+            continue
+        hash_items.setdefault(info_hash, []).append(item)
+        hash_trackers.setdefault(info_hash, set()).update(trackers)
+
+    unresolved = set()
+    with _swarm_cache_lock:
+        for info_hash, items in hash_items.items():
+            cached = _swarm_cache.get(info_hash)
+            if cached and cached[0] > now:
+                _, seeders, peers, known = cached
+                for item in items:
+                    item.update(seeders=seeders, peers=peers, swarm_known=known)
+            else:
+                _swarm_cache.pop(info_hash, None)
+                unresolved.add(info_hash)
+
+    tracker_hashes = {}
+    for info_hash in unresolved:
+        for tracker in hash_trackers.get(info_hash, set()):
+            tracker_hashes.setdefault(tracker, set()).add(info_hash)
+
+    reports = {info_hash: [] for info_hash in unresolved}
+    if tracker_hashes:
+        with ThreadPoolExecutor(max_workers=TRACKER_SCRAPE_WORKERS) as executor:
+            futures = {
+                executor.submit(tracker_scrape, tracker, sorted(info_hashes)): tracker
+                for tracker, info_hashes in tracker_hashes.items()
+            }
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    app.logger.debug("Tracker scrape failed for %s: %s", futures[future], exc)
+                    continue
+                for info_hash, counts in result.items():
+                    if info_hash in reports:
+                        reports[info_hash].append(counts)
+
+    cache_seconds = TRACKER_SCRAPE_CACHE_MINUTES * 60
+    with _swarm_cache_lock:
+        for info_hash in unresolved:
+            candidates = reports.get(info_hash) or []
+            if candidates:
+                seeders, leechers = max(candidates, key=lambda value: (value[0], sum(value)))
+                peers = seeders + leechers
+                known = True
+                expires = now + cache_seconds
+            else:
+                seeders = peers = 0
+                known = False
+                expires = now + min(cache_seconds, 60)
+            _swarm_cache[info_hash] = (expires, seeders, peers, known)
+            for item in hash_items.get(info_hash, []):
+                item.update(seeders=seeders, peers=peers, swarm_known=known)
+
+    return sum(1 for item in releases if item.get("swarm_known"))
+
+
 def parse_relative_date(value):
     now = datetime.now(timezone.utc)
     text = (value or "").strip()
@@ -595,8 +876,8 @@ def rss_xml(releases, max_results=None, offset=0):
   <enclosure url="{xml_escape(link)}" length="{item['size']}" type="application/x-bittorrent" />
   <torznab:attr name="category" value="{item['category']}" />
   <torznab:attr name="size" value="{item['size']}" />
-  <torznab:attr name="seeders" value="1" />
-  <torznab:attr name="peers" value="1" />
+  <torznab:attr name="seeders" value="{max(0, int(item.get('seeders', 0)))}" />
+  <torznab:attr name="peers" value="{max(0, int(item.get('peers', 0)))}" />
 </item>""")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:torznab="http://torznab.com/schemas/2015/feed">
@@ -701,6 +982,9 @@ def health():
         "fetchMode": FETCH_MODE,
         "flaresolverrMaxTimeoutMs": FLARESOLVERR_MAX_TIMEOUT,
         "flaresolverrHttpTimeoutSec": FLARESOLVERR_HTTP_TIMEOUT,
+        "trackerScrapeEnabled": TRACKER_SCRAPE_ENABLED,
+        "trackerScrapeTimeoutSec": TRACKER_SCRAPE_TIMEOUT,
+        "trackerScrapeCacheMinutes": TRACKER_SCRAPE_CACHE_MINUTES,
         "automaticLoginConfigured": bool(
             AUTO_LOGIN and username and password
         ),
@@ -761,9 +1045,14 @@ def api():
         for item in releases
         if release_matches_season_episode(item["title"], season, episode)
     ]
+    swarm_known = 0
+    if TRACKER_SCRAPE_ENABLED and not is_validation:
+        swarm_known = enrich_swarm_counts(
+            releases[offset:offset + result_limit]
+        )
     returned = len(releases[offset:offset + result_limit])
     app.logger.info(
-        "Torznab %s query=%r site_query=%r season=%r episode=%r works<=%d fetched=%d matched=%d offset=%d returned=%d",
+        "Torznab %s query=%r site_query=%r season=%r episode=%r works<=%d fetched=%d matched=%d offset=%d returned=%d swarm_known=%d",
         action,
         query,
         site_query,
@@ -774,6 +1063,7 @@ def api():
         len(releases),
         offset,
         returned,
+        swarm_known,
     )
     return Response(
         rss_xml(releases, result_limit, offset),

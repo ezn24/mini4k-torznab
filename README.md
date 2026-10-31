@@ -13,6 +13,7 @@ Mini4K Torznab converts Mini4K search results into a Torznab feed for Prowlarr, 
 - Authenticated proxying for protected `.torrent` files
 - Cloud-drive-only result filtering
 - Encrypted credentials for automatic account-session renewal
+- Tracker-observed seeder and peer counts for magnet releases
 
 ## Architecture
 
@@ -130,6 +131,24 @@ curl http://127.0.0.1:8787/health
 curl "http://127.0.0.1:8787/v2/api?t=caps&apikey=YOUR_API_KEY"
 ```
 
+## Seeder and peer counts
+
+For magnet releases, the bridge extracts the BTIH and queries all advertised HTTP(S) and UDP trackers that support scraping. Tracker populations are not added together because the same client may announce to several trackers. The bridge reports the valid response with the highest seeder count and sets `peers` to seeders plus leechers.
+
+Results are cached for 30 minutes by default. A value of `0` means that no supported tracker returned a count; it does not prove that the torrent has no DHT peers. Direct `.torrent` releases also remain `0` during search because the bridge does not download every torrent file merely to calculate its info-hash.
+
+The relevant environment variables are:
+
+- `TRACKER_SCRAPE_ENABLED=true`
+- `TRACKER_SCRAPE_TIMEOUT=3`
+- `TRACKER_SCRAPE_CACHE_MINUTES=30`
+- `TRACKER_SCRAPE_MAX_RESULTS=50`
+- `TRACKER_SCRAPE_WORKERS=12`
+
+## GitHub Container Registry
+
+The included workflow tests the Python code and publishes the lightweight image to `ghcr.io/OWNER/REPOSITORY`. It builds `linux/amd64` and `linux/arm64`, publishes `latest` from the default branch, and creates semantic-version and commit-SHA tags. Pull requests are built but not published.
+
 ## Development and local builds
 
 ```bash
@@ -146,7 +165,7 @@ The default Dockerfile builds the lightweight FlareSolverr-backed image. `Docker
 - Mini4K and Cloudflare are external dependencies; searches may be slow or temporarily fail.
 - CAPTCHA and MFA challenges cannot be handled reliably.
 - IMDb- or TVDB-ID-only searches are not supported.
-- Seeder and peer values are currently compatibility placeholders, not real swarm counts.
+- Seeder values are tracker-observed counts, not an exact global DHT population.
 - Empty validation searches use configured test titles. Disable RSS for this indexer if it is not needed.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md), [Synology installation](docs/SYNOLOGY.md), and [security guidance](docs/SECURITY.md).
