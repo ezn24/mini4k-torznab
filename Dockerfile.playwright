@@ -1,0 +1,10 @@
+FROM mcr.microsoft.com/playwright/python:v1.62.0-noble
+
+WORKDIR /app
+COPY requirements.txt requirements.playwright.txt ./
+RUN pip install --no-cache-dir -r requirements.playwright.txt
+COPY app.py credential_crypto.py credential_tool.py ./
+
+EXPOSE 8787
+CMD ["gunicorn", "--bind", "0.0.0.0:8787", "--workers", "1", "--threads", "4", "--timeout", "240", "--access-logfile", "-", "--error-logfile", "-", "--capture-output", "app:app"]
+

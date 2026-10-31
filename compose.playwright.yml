@@ -1,0 +1,7 @@
+services:
+  mini4k-torznab:
+    build:
+      dockerfile: Dockerfile.playwright
+    environment:
+      FETCH_MODE: playwright
+
