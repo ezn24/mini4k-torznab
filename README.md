@@ -34,7 +34,7 @@ Edit at least these values in `.env`:
 - `API_KEY`: a new long random value
 - `MEDIA_NETWORK`: the existing Docker network used by Prowlarr
 - `DATA_PATH`: the host directory for persistent session data
-- `MINI4K_IMAGE`: a published image name, or `mini4k-torznab:local`
+- `MINI4K_IMAGE`: `ghcr.io/ezn24/mini4k-torznab:latest`, or `mini4k-torznab:local`
 
 Find Prowlarr's network with:
 
@@ -61,7 +61,13 @@ docker compose up -d mini4k-torznab
 To use a published image instead:
 
 ```dotenv
-MINI4K_IMAGE=ghcr.io/OWNER/REPOSITORY:latest
+MINI4K_IMAGE=ghcr.io/ezn24/mini4k-torznab:latest
+```
+
+The repository and its package are private by default. Authenticate the NAS with a GitHub personal access token that has `read:packages` before pulling:
+
+```bash
+echo "YOUR_GITHUB_TOKEN" | docker login ghcr.io -u ezn24 --password-stdin
 ```
 
 ```bash
@@ -147,7 +153,7 @@ The relevant environment variables are:
 
 ## GitHub Container Registry
 
-The included workflow tests the Python code and publishes the lightweight image to `ghcr.io/OWNER/REPOSITORY`. It builds `linux/amd64` and `linux/arm64`, publishes `latest` from the default branch, and creates semantic-version and commit-SHA tags. Pull requests are built but not published.
+The included workflow tests the Python code and publishes the lightweight image to `ghcr.io/ezn24/mini4k-torznab`. It builds `linux/amd64` and `linux/arm64`, publishes `latest` from the default branch, and creates semantic-version and commit-SHA tags. Pull requests are built but not published.
 
 ## Development and local builds
 
